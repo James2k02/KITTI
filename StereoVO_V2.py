@@ -19,13 +19,12 @@ class VisualOdometry():
         self.disparity = cv2.StereoSGBM_create(minDisparity=0, numDisparities=32, blockSize=block, P1=P1, P2=P2)
         self.disparities = [
             np.divide(self.disparity.compute(self.images_l[0], self.images_r[0]).astype(np.float32), 16)]
-        self.fastFeatures = cv2.FastFeatureDetector_create()
+        self.akaze = cv2.AKAZE_create()
 
-        self.lk_params = dict(winSize=(15, 15),
-                              flags=cv2.MOTION_AFFINE,
-                              maxLevel=3,
-                              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.03))
-
+        index_params = dict(algorithm=1, trees=5)
+        search_params = dict(checks=50)
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        
     @staticmethod
         
     def _load_calib(filepath):
@@ -179,19 +178,16 @@ class VisualOdometry():
             impatch = img[y:y + tile_h, x:x + tile_w]
 
             # Detect keypoints
-            keypoints = self.fastFeatures.detect(impatch)
-
-            # Correct the coordinate for the point
-            for pt in keypoints:
-                pt.pt = (pt.pt[0] + x, pt.pt[1] + y)
+            keypoints = self.akaze.detect(impatch, None)
 
             # Get the 10 best keypoints
             if len(keypoints) > 10:
                 keypoints = sorted(keypoints, key=lambda x: -x.response)
                 return keypoints[:10]
             return keypoints
+        
         # Get the image height and width
-        h, w, *_ = img.shape
+        h, w = img.shape
 
         # Get the keypoints for each of the tiles
         kp_list = [get_kps(x, y) for y in range(0, h, tile_h) for x in range(0, w, tile_w)]
@@ -386,6 +382,25 @@ class VisualOdometry():
         transformation_matrix = self._form_transf(R, t)
         return transformation_matrix
     
+    def match_features(self, img1, img2):
+        kp1, des1 = self.akaze.detectAndCompute(img1, None)
+        kp2, des2 = self.akaze.detectAndCompute(img2, None)
+
+        if des1 is None or des2 is None:
+            return np.array([]), np.array([])
+
+        matches = self.matcher.knnMatch(des1, des2, k=2)
+
+        good_matches = []
+        for m, n in matches:
+            if m.distance < 0.75 * n.distance:
+                good_matches.append(m)
+
+        pts1 = np.float32([kp1[m.queryIdx].pt for m in good_matches])
+        pts2 = np.float32([kp2[m.trainIdx].pt for m in good_matches])
+        return pts1, pts2
+
+    
     def get_pose(self, i):
         """
         Calculates the transformation matrix for the i'th frame
@@ -399,19 +414,15 @@ class VisualOdometry():
         transformation_matrix (ndarray): The transformation matrix. Shape (4,4)
         """
         # Get the i-1'th image and i'th image
-        img1_l, img2_l = self.images_l[i - 1:i + 1]
+        img1, img2 = self.images_l[i - 1], self.images_l[i]
 
-        # Get teh tiled keypoints
-        kp1_l = self.get_tiled_keypoints(img1_l, 10, 20)
-
-        # Track the keypoints
-        tp1_l, tp2_l = self.track_keypoints(img1_l, img2_l, kp1_l)
-
+        tp1, tp2 = self.match_features(img1, img2)
+        
         # Calculate the disparitie
-        self.disparities.append(np.divide(self.disparity.compute(img2_l, self.images_r[i]).astype(np.float32), 16))
+        self.disparities.append(np.divide(self.disparity.compute(img2, self.images_r[i]).astype(np.float32), 16))
 
         # Calculate the right keypoints
-        tp1_l, tp1_r, tp2_l, tp2_r = self.calculate_right_qs(tp1_l, tp2_l, self.disparities[i - 1], self.disparities[i])
+        tp1_l, tp1_r, tp2_l, tp2_r = self.calculate_right_qs(tp1, tp2, self.disparities[i - 1], self.disparities[i])
                    
         # Calculate the 3D points
         Q1, Q2 = self.calc_3d(tp1_l, tp1_r, tp2_l, tp2_r)
@@ -420,25 +431,12 @@ class VisualOdometry():
         transformation_matrix = self.estimate_pose(tp1_l, tp2_l, Q1, Q2)
         return transformation_matrix
     
-def visualize_paths_with_error(gt_path, estimated_path, title="Visual Odometry Path with Error"):
-    """
-    Visualizes the ground truth path, estimated path, and error.
-
-    Parameters
-    ----------
-    gt_path : list of tuples
-        Ground truth trajectory as (x, z) coordinates.
-    estimated_path : list of tuples
-        Estimated trajectory as (x, z) coordinates.
-    title : str
-        Title of the plot.
-    """
-    # Calculate errors
+def visualize_paths_with_error_and_rotation(gt_path, estimated_path, rotation_errors, title="Visual Odometry Path with Error"):
     errors = [np.linalg.norm(np.array(gt) - np.array(est)) for gt, est in zip(gt_path, estimated_path)]
 
-    # Plot the ground truth and estimated paths
-    plt.figure(figsize=(12, 8))
-    plt.subplot(2, 1, 1)  # First subplot for paths
+    plt.figure(figsize=(14, 10))
+
+    plt.subplot(3, 1, 1)
     plt.plot([p[0] for p in gt_path], [p[1] for p in gt_path], label="Ground Truth Path", color="green")
     plt.plot([p[0] for p in estimated_path], [p[1] for p in estimated_path], label="Estimated Path", color="blue")
     plt.xlabel("X-axis")
@@ -447,38 +445,49 @@ def visualize_paths_with_error(gt_path, estimated_path, title="Visual Odometry P
     plt.legend()
     plt.grid()
 
-    # Plot the error over time
-    plt.subplot(2, 1, 2)  # Second subplot for errors
-    plt.plot(range(len(errors)), errors, label="Error (Euclidean Distance)", color="red")
+    plt.subplot(3, 1, 2)
+    plt.plot(range(len(errors)), errors, label="Translational Error", color="red")
     plt.xlabel("Frame Index")
     plt.ylabel("Error (meters)")
-    plt.title("Error Between Ground Truth and Estimated Path")
     plt.legend()
     plt.grid()
 
-    # Show both plots
+    plt.subplot(3, 1, 3)
+    plt.plot(range(len(rotation_errors)), rotation_errors, label="Rotational Error (degrees)", color="orange")
+    plt.xlabel("Frame Index")
+    plt.ylabel("Rotational Error (degrees)")
+    plt.legend()
+    plt.grid()
+
     plt.tight_layout()
     plt.show()
     
 def main():
-    data_dir = 'C:/Users/james/OneDrive/Documents/University/Year 4/dataset/sequences/000'  
+    data_dir = 'C:/Users/james/OneDrive/Documents/University/Year 4/dataset/sequences/00'
     vo = VisualOdometry(data_dir)
-
-    # play_trip(vo.images_l, vo.images_r)  # Comment out to not play the trip
 
     gt_path = []
     estimated_path = []
+    rotation_errors = []
+
     max_frames = 495
-    for i, gt_pose in enumerate(tqdm(vo.gt_poses[:max_frames], unit="poses")):
+    for i, gt_pose in enumerate(tqdm(vo.gt_poses, unit="poses")):
         if i < 1:
             cur_pose = gt_pose
         else:
             transf = vo.get_pose(i)
             cur_pose = np.matmul(cur_pose, transf)
+
+            gt_rotation = gt_pose[:3, :3]
+            est_rotation = cur_pose[:3, :3]
+            relative_rotation = np.dot(gt_rotation.T, est_rotation)
+            angle = np.arccos((np.trace(relative_rotation) - 1) / 2)
+            rotation_errors.append(np.degrees(angle))
+
         gt_path.append((gt_pose[0, 3], gt_pose[2, 3]))
         estimated_path.append((cur_pose[0, 3], cur_pose[2, 3]))
 
-    visualize_paths_with_error(gt_path, estimated_path)
+    visualize_paths_with_error_and_rotation(gt_path, estimated_path, rotation_errors)
 
 if __name__ == "__main__":
     main()    
