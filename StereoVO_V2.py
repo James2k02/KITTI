@@ -4,6 +4,7 @@ import numpy as np # Numerical operations
 from scipy.optimize import least_squares # Optimization for non-linear least squares problems
 import matplotlib.pyplot as plt # Plotting for visualization
 from tqdm import tqdm # Progress bar for loops
+from sklearn.linear_model import RANSACRegressor
 
 class VisualOdometry():
     def __init__(self, data_dir): # the __init__ method initializes the VisualOdometry class so it gets called when an object of this class is created
@@ -19,27 +20,33 @@ class VisualOdometry():
         self.images_r = self._load_images(data_dir + '/image_1')
         
         # block is the size of the window used for comparing pixel intensities between the left and right images
-        block = 11 # larger block sizes average more pixel intensities which smooths out noise but reduces detail in the map
+        block = 15 # larger block sizes average more pixel intensities which smooths out noise but reduces detail in the map
         P1 = block * block * 8 # penalty for small changes in disparity between neighboring pixel (higher values reduce noise in disparity maps)
         P2 = block * block * 32 # penalty for larger changes in disparity (high value encourages smoother disparity maps)
         
         # create a stereo block matching object for computing disparity maps between left and right images
         # (min possible disp value; 0 = no shift, range of disparity values, size of block, smoothness parameters)
         # disparity value is just a number that represents the horizontal shift (in pixels) of a point between the left and right images
-        self.disparity = cv2.StereoSGBM_create(minDisparity = 0, numDisparities = 32, blockSize = block, P1 = P1, P2 = P2) 
+        self.disparity = cv2.StereoSGBM_create(minDisparity = 0, numDisparities = 64, blockSize = block, P1 = P1, P2 = P2, disp12MaxDiff = 1, uniquenessRatio = 12, speckleWindowSize = 75, speckleRange = 2, preFilterCap = 63) 
         
         # compute and stores disparity map for first pair of images then divides the map by 16 to normalize them bc OpenCV disp values are scaled by 16
         # dividing by 16 restores the original disparity value in real-world units
         self.disparities = [np.divide(self.disparity.compute(self.images_l[0], self.images_r[0]).astype(np.float32), 16)]
         
         # initializes AKAZW which is a robust method for detecting and describing key points in images (optimized for speed so real-time)
-        self.akaze = cv2.AKAZE_create()
+        #self.akaze = cv2.AKAZE_create()
+        self.detector = cv2.SIFT_create(nfeatures = 9000, contrastThreshold = 0.02, edgeThreshold = 17, sigma = 1.2)
 
         # index_params = dict(algorithm =1, trees=5)
         # search_params = dict(checks=50)
         
         # create a brute force matcher for comparing feature descriptors
-        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck = False) # Hamming distance as metric for comparing, disable cross-checking to allow for more flexible matches
+        #self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck = False) # Hamming distance as metric for comparing, disable cross-checking to allow for more flexible matches
+        #self.matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck = True)
+        FLANN_INDEX_KDTREE = 1
+        index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 12)
+        search_params = dict(checks = 100)  # Increase 'checks' for better accuracy
+        self.matcher = cv2.FlannBasedMatcher(index_params, search_params)
         
     @staticmethod # inidicates that the following method does not depend on instance variables or methods
         
@@ -457,7 +464,7 @@ class VisualOdometry():
         Q2 = np.transpose(Q2[:3] / Q2[3])
         return Q1, Q2 # returns 3D coordinates of both frames
     
-    def estimate_pose(self, q1, q2, Q1, Q2, max_iter=100): # max iterations for optimization process
+    def estimate_pose(self, q1, q2, Q1, Q2, max_iter = 100, ransac_thresh = 3.0): # max iterations for optimization process
         """
         Estimates the transformation matrix
 
@@ -487,7 +494,7 @@ class VisualOdometry():
             sample_q1, sample_q2, sample_Q1, sample_Q2 = q1[sample_idx], q2[sample_idx], Q1[sample_idx], Q2[sample_idx] # corresponding 2D and 3D points
 
             # Make the start guess
-            in_guess = np.zeros(6) # 6 parameters: rx, ry, rz, tx, ty, tz for rotationa and translation
+            in_guess = np.zeros(6) # 6 parameters: rx, ry, rz, tx, ty, tz for rotation and translation
             
             # Perform least squares optimization
             # Optimizes the transformation parameters to minimize
@@ -497,7 +504,7 @@ class VisualOdometry():
             # method = 'lm': Levenberg-Marquardt optimization method (good for non-linear problems)
             # max_nfev = 200: max number of function evaluations
             # args: passes the sampled 2D and 3D points as arguments
-            opt_res = least_squares(self.reprojection_residuals, in_guess, method = 'lm', max_nfev = 200,
+            opt_res = least_squares(self.reprojection_residuals, in_guess, method = 'trf', loss= 'huber', f_scale = 2.0, max_nfev = 200,
                                     args = (sample_q1, sample_q2, sample_Q1, sample_Q2))
 
             # Calculate the error for the optimized transformation
@@ -528,6 +535,26 @@ class VisualOdometry():
         transformation_matrix = self._form_transf(R, t)
         return transformation_matrix
     
+    # def estimate_pose(self, q1, q2, Q1, Q2):
+    #     model = RANSACRegressor(residual_threshold=2.0)
+    #     model.fit(Q1, Q2)
+    #     inliers = model.inlier_mask_
+
+    #     q1_inliers = q1[inliers]
+    #     q2_inliers = q2[inliers]
+    #     Q1_inliers = Q1[inliers]
+    #     Q2_inliers = Q2[inliers]
+
+    #     in_guess = np.zeros(6)
+    #     opt_res = least_squares(self.reprojection_residuals, in_guess, method='lm', max_nfev=200,
+    #                         args=(q1_inliers, q2_inliers, Q1_inliers, Q2_inliers))
+
+    #     r = opt_res.x[:3]
+    #     R, _ = cv2.Rodrigues(r)
+    #     t = opt_res.x[3:]
+    #     transformation_matrix = self._form_transf(R, t)
+    #     return transformation_matrix
+    
     def match_features(self, img1, img2):
         # This function is part of a feature-matching pipeline that identifies corresponding points in two images based on feature descriptors
         # The function matches keypoints (feature points0 between two images by:
@@ -539,8 +566,8 @@ class VisualOdometry():
         # Detect keypoints and descriptors for both images
         # Keypoints are points of interest like corners, edges, blobs
         # Descriptors are numeric vectors describing the local image patch around each keypoint used to compare keypoints between images        
-        kp1, des1 = self.akaze.detectAndCompute(img1, None) # None is no mask
-        kp2, des2 = self.akaze.detectAndCompute(img2, None)
+        kp1, des1 = self.detector.detectAndCompute(img1, None) # None is no mask
+        kp2, des2 = self.detector.detectAndCompute(img2, None)
 
         if des1 is None or des2 is None:
             return np.array([]), np.array([])
@@ -548,11 +575,13 @@ class VisualOdometry():
         # Match the descriptors between the two images using k-nearest neighbors (k-NN)
         # For each descriptor in des1, it finds the k = 2 closest descriptors in des2 based on Euclidean distance
         matches = self.matcher.knnMatch(des1, des2, k = 2) # a list of matches, where each match contains two neighbors  (k = 2)
+        #matches = self.matcher.match(des1, des2)
+        #matches = sorted(matches, key=lambda x: x.distance)
 
         good_matches = []
         for m, n in matches: # m is the best (closest match) and n is the second-best match
             # we use the second-best to help determine if the best match is distinct or ambiguous
-            if m.distance < 0.75 * n.distance: # Lowe's Ratio test to reduce false positives in matching by ensuring the best match is distinct from the second-best match
+            if m.distance < 0.6 * n.distance: # Lowe's Ratio test to reduce false positives in matching by ensuring the best match is distinct from the second-best match
                 good_matches.append(m) # if it satisfies the test, then add to good_matches
 
         # For each "good match", retrieves the 2D coordinates of the corresponding keypoints
@@ -637,31 +666,81 @@ def visualize_paths_with_error_and_rotation(gt_path, estimated_path, rotation_er
     plt.show()
     
 def main():
+    # This function integrates the visual odometry pipeline by calling get_pose and computes the estimated cam trajectory while comparing it to the ground truth
+    
     data_dir = 'C:/Users/james/OneDrive/Documents/University/Year 4/dataset/sequences/01'
-    vo = VisualOdometry(data_dir)
+    vo = VisualOdometry(data_dir) # creates an instance of this class so will call __init__ when this happens
 
-    gt_path = []
-    estimated_path = []
-    rotation_errors = []
+    gt_path = [] # stores the ground truth cam positions (from vo.gt_poses)
+    estimated_path = [] # stores the estimated cam positions computed using get_pose
+    rotation_errors = [] # tracks the angular error in rotation for each frame
 
     max_frames = 495
-    for i, gt_pose in enumerate(tqdm(vo.gt_poses, unit = "poses")):
+    for i, gt_pose in enumerate(tqdm(vo.gt_poses, unit = "poses")): # iterates overs the ground truth poses (vo.gt_poses), one for each frame
         if i < 1:
-            cur_pose = gt_pose
+            cur_pose = gt_pose # for the first frame, the current pose is initialized to the ground truth pose (no motion estimation because no previous frames to compare with)
         else:
-            transf = vo.get_pose(i)
-            cur_pose = np.matmul(cur_pose, transf)
+            transf = vo.get_pose(i) # computes the transformation matrix for the ith frame
+            cur_pose = np.matmul(cur_pose, transf) # updates the current pose
 
-            gt_rotation = gt_pose[:3, :3]
-            est_rotation = cur_pose[:3, :3]
-            relative_rotation = np.dot(gt_rotation.T, est_rotation)
-            angle = np.arccos((np.trace(relative_rotation) - 1) / 2)
-            rotation_errors.append(np.degrees(angle))
+            gt_rotation = gt_pose[:3, :3] # ground truth rotation matrix
+            est_rotation = cur_pose[:3, :3] # estimated rotation matrix
+            relative_rotation = np.dot(gt_rotation.T, est_rotation) # relative rotation matrix
+            angle = np.arccos((np.trace(relative_rotation) - 1) / 2) # calculating the angle of rotation
+            rotation_errors.append(np.degrees(angle)) # convert to degrees then append to rotation_errors
 
-        gt_path.append((gt_pose[0, 3], gt_pose[2, 3]))
+        # Extracting the x and z coordinates of the cam position from the grouth truth pose and estimate pose and append them to specified variables
+        gt_path.append((gt_pose[0, 3], gt_pose[2, 3])) # it's [0, 3] and [2, 3] because the translation matrix is in the last row, 0 and 2 are x and z respectively
         estimated_path.append((cur_pose[0, 3], cur_pose[2, 3]))
 
     visualize_paths_with_error_and_rotation(gt_path, estimated_path, rotation_errors)
 
 if __name__ == "__main__":
     main()    
+    
+'''FULL PIPELINE EXPLANATION'''
+
+# The main goal of the code is to estimate the cam's motion (trajectory) from stereo images using visual odometry
+
+# INITIALIZATION
+#   1) Loading Calibration, Images, and Ground Truth
+#     - _load_calib(filepath): loads intrinsic and projection matrices for left and right cam which are used to transform 3D points into image space and calculate disparities
+#     - _load_poses(filepath): reads the ground truth poses (4x4 transformation matrices) for evaluation and visualization
+#     - _load_images(filepath): loads grayscale images from the dataset for both left and right cams
+#     - purpose of this section is initialize cam parameters, ground truth, and image data
+#
+#   2) Disparity Map Initialization
+#     - cv2.StereoSGBM_create(): initializes a stereo block matching object for computing disparity maps which are used for depth esimation by matching pixels between left and right images
+#
+#   3) Feature Detector and Matcher Initialization
+#     - AKAZE Detector (self.akaze): detects and describes feature points in the images (can change methods if needed)
+#     - BFMatcher (self.matcher): matches features descriptors using the Hamming distance (can change methods if needed)
+#
+# PIPELINE FOR EACH FRAME (1-5 done in get_pose function)
+#   1) Feature Matching
+#     - match_features(img1, img2): detects feature points and descriptors in two consecutive frames and matches descriptors between frames using k-NN and Lowe's test to find good points
+#   
+#   2) Disparity Map Calculation
+#     - self_disparity.compute(img2, self.images_r[i]): computes the disparity map for the current frame (left-right images) then normalized by dividing by 16 to get the actual disparity
+#                                                       values which is used for depth esimation (enables 3D triangulation)
+#   3) Calculate Stereo Feature Points
+#    - calculate_right_qs(q1, q2, disp1, disp2): uses disparity maps to calculate corresponding points in the right image for matched points in the left image and filters points based
+#                                                based on valid disparity ranges (the purpose is to ensure accurate stereo correspondences for depth calculation)
+#
+#   4) Triangulate 3D Points
+#     - calc_3d(q1_l, q1_r, q2_l, q2_r): triangulates 3D points from matched feature points in stereo pairs (left and right images); converts 2D keypoints into 3D coordinates using cam
+#                                        calibration (the purpose is to create 3D points in the world frame for pose estimation)
+#
+#   5) Estimate Pose
+#     - estimate_pose(q1, q2, Q1, Q2): estimates the cam's transformation between two frames; it also optimizes
+#                                             the pose by performing least-squares optimization to minimize reprojection errors then converts the optimized rotation and translation into a
+#                                             4x4 transformation matrix (the purpose is to determine the cam's motion between consecutive frames)
+#
+#   6) Update Pose
+#     - cur_pose = np.matmul(cur_pose, transf): updates the current pose by multiplying the previous pose with the estimated transformation matrix
+#
+# POST-PROCESSING AND VISUALIZATION
+#   1) Error Calculation
+#     - Rotational and translational error
+#   2) Visualization
+#     - plotting ground truth vs. estimated trajectory, translational error over frames, and rotational error over frames
