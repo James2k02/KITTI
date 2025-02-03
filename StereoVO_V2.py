@@ -35,7 +35,7 @@ class VisualOdometry():
         
         # initializes AKAZW which is a robust method for detecting and describing key points in images (optimized for speed so real-time)
         #self.akaze = cv2.AKAZE_create()
-        self.detector = cv2.SIFT_create(nfeatures = 9000, contrastThreshold = 0.02, edgeThreshold = 17, sigma = 1.2)
+        self.detector = cv2.ORB_create(5000)#SIFT_create(nfeatures = 9000, contrastThreshold = 0.02, edgeThreshold = 17, sigma = 1.2)
 
         # index_params = dict(algorithm =1, trees=5)
         # search_params = dict(checks=50)
@@ -43,8 +43,8 @@ class VisualOdometry():
         # create a brute force matcher for comparing feature descriptors
         # self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck = False) # Hamming distance as metric for comparing, disable cross-checking to allow for more flexible matches
         # self.matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck = True)
-        FLANN_INDEX_KDTREE = 1
-        index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 12)
+        FLANN_INDEX_LSH = 6
+        index_params = dict(algorithm=FLANN_INDEX_LSH, table_number=6, key_size=12, multi_probe_level=1)
         search_params = dict(checks = 100)  # Increase 'checks' for better accuracy
         self.matcher = cv2.FlannBasedMatcher(index_params, search_params)
         
@@ -564,7 +564,7 @@ def visualize_paths_with_error_and_rotation(gt_path, estimated_path, rotation_er
 def main():
     # This function integrates the visual odometry pipeline by calling get_pose and computes the estimated cam trajectory while comparing it to the ground truth
     
-    data_dir = 'C:/Users/james/OneDrive/Documents/University/Year 4/dataset/sequences/08'
+    data_dir = 'C:/Users/james/OneDrive/Documents/University/Year 4/dataset/sequences/00'
     vo = VisualOdometry(data_dir) # creates an instance of this class so will call __init__ when this happens
 
     gt_path = [] # stores the ground truth cam positions (from vo.gt_poses)
