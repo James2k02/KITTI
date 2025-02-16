@@ -4,7 +4,6 @@ import numpy as np # Numerical operations
 from scipy.optimize import least_squares # Optimization for non-linear least squares problems
 import matplotlib.pyplot as plt # Plotting for visualization
 from tqdm import tqdm # Progress bar for loops
-from sklearn.linear_model import RANSACRegressor
 
 class VisualOdometry():
     def __init__(self, data_dir): # the __init__ method initializes the VisualOdometry class so it gets called when an object of this class is created
@@ -33,15 +32,18 @@ class VisualOdometry():
         # dividing by 16 restores the original disparity value in real-world units
         self.disparities = [np.divide(self.disparity.compute(self.images_l[0], self.images_r[0]).astype(np.float32), 16)]
         
-        # initializes BRISK which is a robust method for detecting and describing key points in images (optimized for speed so real-time)
-        self.detector = cv2.BRISK_create(thresh = 30, octaves = 3)
-        
-        self.lk_params = dict(winSize = (15, 15),
-                              flags = cv2.MOTION_AFFINE,
-                              maxLevel = 3,
-                              criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.03))
+        # initializes ORB        
+        self.detector = cv2.ORB_create(5000)
 
-       
+        # index_params = dict(algorithm =1, trees=5)
+        # search_params = dict(checks=50)
+        
+        # create a FLANN-based matcher for comparing feature descriptors
+        FLANN_INDEX_LSH = 6
+        index_params = dict(algorithm=FLANN_INDEX_LSH, table_number=6, key_size=12, multi_probe_level=1)
+        search_params = dict(checks = 100)  # Increase 'checks' for better accuracy
+        self.matcher = cv2.FlannBasedMatcher(index_params, search_params)
+        
     @staticmethod # inidicates that the following method does not depend on instance variables or methods
         
     def _load_calib(filepath):
@@ -249,140 +251,8 @@ class VisualOdometry():
         #   - Only use T^-1 when projecting 3D points from frame 1 (Q1) into frame 2 (q2_pred) --> bc T^-1 applies the "forward" transformation to points that originally came from frame 1
         
         return residuals
-    
-    def get_tiled_keypoints(self, img, tile_h, tile_w): # passes an img for keypoint detection, the height (row) and width (column) of each tile
-        """
-        Splits the image into tiles and detects the 10 best keypoints in each tile
-
-        Parameters
-        ----------
-        img (ndarray): The image to find keypoints in. Shape (height, width)
-        tile_h (int): The tile height
-        tile_w (int): The tile width
-
-        Returns
-        -------
-        kp_list (ndarray): A 1-D list of all keypoints. Shape (n_keypoints)
-        """
-        # Alex said when he was going around the building, it has trouble detecting keypoints in areas with glass, maybe this could help
-        
-        # The function detects keypoints in an image by splitting it into smaller tiles. In each tile, it:
-        #   - detects the top 10 strongest keypoints using the AKAZE feature detector
-        #   - collects these keypoints from all tiles and flattens them into a single list
-        # Using tiled keypoints:
-        #   - keypoints are detected in every region of the image, even in areas with less texture or distinct features
-        #   - ensures coverage in feature-poor regions that might otherwise be ignored
-        #   - for tasks like visual odometry or SLAM, even distribution ensures that keypoints are available across the scene, reducing the risk of losing track of the camera
-        #   - without tiling, keypoints might cluster in high-texture areas (like corners of objects), leaving other parts of the image unrepresented
-        
-        def get_kps(y, x): # x and y coordinate of the top-left corner of the tile
-            # This subfunction detects keypoints for a single tile of the image
-            
-            # Convert the image to grayscale if it's not already
-            if len(img.shape) == 3 and img.shape[2] == 3:
-                img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            else:
-                img_gray = img
-                
-            # Get the image tile
-            impatch = img_gray[y:min(y + tile_h, h), x:min(x + tile_w, w)] # takes a slice of the image depending on the tile height and width
-            
-            # Debugging: Print tile info
-            print(f"Processing tile at ({x}, {y}), shape: {impatch.shape}")    
-            
-            # Validate the tile dimensions
-            if impatch.size == 0 or impatch.shape[0] < 2 or impatch.shape[1] < 2:
-                print(f"Skipping too-small tile at ({x}, {y}) with shape {impatch.shape}")
-                return []
-            
-            # Detect keypoints
-            keypoints = self.detector.detect(impatch, None) # each keypoint includes the position (x,y in the tile) and the strength (response) which is how strong or distinct the keypoint is
-
-            # Correct the coordinate for the point
-            for pt in keypoints:
-                pt.pt = (pt.pt[0] + x, pt.pt[1] + y)
-                
-            # Get the 10 best keypoints
-            # If the number of detected keypoints is > 10, then sort the keypoints by response in descending order and keep the 10 stronger keypoints
-            if len(keypoints) > 10:
-                keypoints = sorted(keypoints, key = lambda x: -x.response)[:10] # sorts keypoints by response in descending order and keeps the top 10
-            return keypoints
-        
-        # Get the image height and width of the input image
-        h, w = img.shape
-
-        # Get the keypoints for each of the tiles
-        # Iterates over all tiles in the image by stepping through the image in chunks of size (tile_h, tile_w) and then for each tile, it calls the get_kps function to detect keypoints
-        kp_list = [get_kps(y, x) for y in range(0, h, tile_h) for x in range(0, w, tile_w)] # a list of lists where each sublist contains keypoints from one tile
-
-        # Flatten the keypoint list
-        # Combines all keypoints from all tiles into a single flat list
-        kp_list_flatten = np.concatenate(kp_list)
-
-        return kp_list_flatten
-           
-    def track_keypoints(self, img1, img2, kp1, max_error=4): # error is the difference in intensity value (brightness or pixel similiarity) between img1 and img2
-        """
-        Tracks the keypoints between frames
-
-        Parameters
-        ----------
-        img1 (ndarray): i-1'th image. Shape (height, width)
-        img2 (ndarray): i'th image. Shape (height, width)
-        kp1 (ndarray): Keypoints in the i-1'th image. Shape (n_keypoints)
-        max_error (float): The maximum acceptable error
-
-        Returns
-        -------
-        trackpoints1 (ndarray): The tracked keypoints for the i-1'th image. Shape (n_keypoints_match, 2)
-        trackpoints2 (ndarray): The tracked keypoints for the i'th image. Shape (n_keypoints_match, 2)
-        """
-        # This function is used to track the movement of keypoints (kp1) from the i-1'th image (img1) to the i'th image (img2) and filter the tracked keypoints based on tracking
-        # quality and geometric constraints
-               
-        # Validate kp1
-        if kp1 is None or len(kp1) == 0:
-            print("No keypoints to track in the first image.")
-            return None, None
-        
-        # Convert the keypoints (kp1) (originally in OpenCV's KeyPoint format) into a numpy array with shape (n_keypoints, 1, 2)
-        trackpoints1 = np.expand_dims(cv2.KeyPoint_convert(kp1), axis = 1).astype(np.float32) # this format is required by the calcOpticalFlowPyrLK function
-
-        # Track the keypoints from img1 to img2 using the Lucas-Kanade optical flow algorithm
-        # trackpoints2 is the predict positions of the tracked keypoints in img2 and has the same shape as trackpoints1
-        # st is a status vector indicating whether each keypoint was successfully tracked (1 if successful, 0 otherwise), shape is (n_keypoints, 1)
-        # err is the tracking error for each keypoint, shape is (n_keypoints, 1)
-        trackpoints2, st, err = cv2.calcOpticalFlowPyrLK(img1, img2, trackpoints1, None, **self.lk_params) # none means no mask so will consider all keypoints from img1 without restrictions
-        # lk_params is just a dictionary for the parameters and the ** means it unpacks the dictionary so its key-value pairs are passed as arguments
-        
-        # Handle cases where no keypoints are tracked
-        if trackpoints2 is None:
-            print("No keypoints were successfully tracked.")
-            return None, None
-    
-        # Convert the status vector to boolean so we can use it as a mask (true for successfully tracked keypoints, false otherwise)
-        trackable = st.astype(bool)
-
-        # Create a mask there selects the keypoints there was trackable and under the max error
-        # Filters the tracked keypoints (trackable) by their tracking error and only keeps keypoints where the error is less than max_error (set in the function arguments)
-        # Returns a boolean mask (under_thresh) for the valid keypoints
-        # A boolean mask is an array of True and Flase values that correspond to whether certain conditions are met for elements in another array
-        #   - in this function, the boolean mask (trackable and under_thresh) helps filter keypoints based on whether they were successfully tracked and if error was below max_error
-        under_thresh = np.where(err[trackable] < max_error, True, False)
-
-        # Use the mask to select the keypoints
-        trackpoints1 = trackpoints1[trackable][under_thresh] # keep only the keypoints in img1 that were successfully tracked and have acceptable error
-        trackpoints2 = np.around(trackpoints2[trackable][under_thresh]) # np.around is just rounding to nearest integer
-
-        # Remove the keypoints there is outside the image
-        h, w = img1.shape
-        in_bounds = np.where(np.logical_and(trackpoints2[:, 1] < h, trackpoints2[:, 0] < w), True, False) # checks if x is between 0 and w and if y is between 0 and h
-        trackpoints1 = trackpoints1[in_bounds]                                                            # np.logical_and combines those conditions
-        trackpoints2 = trackpoints2[in_bounds]
-
-        return trackpoints1, trackpoints2
-    
-    def calculate_right_qs(self, q1, q2, disp1, disp2, min_disp = 0.0, max_disp = 100.0):
+      
+    def calculate_right_qs(self, q1, q2, disp1, disp2, min_disp=0.0, max_disp=100.0):
         """
         Calculates the right keypoints (feature points)
 
@@ -556,7 +426,62 @@ class VisualOdometry():
         # Make the transformation matrix
         transformation_matrix = self._form_transf(R, t)
         return transformation_matrix
-           
+    
+    # def estimate_pose(self, q1, q2, Q1, Q2):
+    #     model = RANSACRegressor(residual_threshold=2.0)
+    #     model.fit(Q1, Q2)
+    #     inliers = model.inlier_mask_
+
+    #     q1_inliers = q1[inliers]
+    #     q2_inliers = q2[inliers]
+    #     Q1_inliers = Q1[inliers]
+    #     Q2_inliers = Q2[inliers]
+
+    #     in_guess = np.zeros(6)
+    #     opt_res = least_squares(self.reprojection_residuals, in_guess, method='lm', max_nfev=200,
+    #                         args=(q1_inliers, q2_inliers, Q1_inliers, Q2_inliers))
+
+    #     r = opt_res.x[:3]
+    #     R, _ = cv2.Rodrigues(r)
+    #     t = opt_res.x[3:]
+    #     transformation_matrix = self._form_transf(R, t)
+    #     return transformation_matrix
+    
+    def match_features(self, img1, img2):
+        # This function is part of a feature-matching pipeline that identifies corresponding points in two images based on feature descriptors
+        # The function matches keypoints (feature points0 between two images by:
+        #   - detecting and describing keypoints in both images
+        #   - matching the descriptors between the two images using a k-nearest neighbor (k-NN) approach
+        #   - filtering the matches to keep only the "good matches"
+        #   - returning the 2D coordinates of the matched points in both images
+        
+        # Detect keypoints and descriptors for both images
+        # Keypoints are points of interest like corners, edges, blobs
+        # Descriptors are numeric vectors describing the local image patch around each keypoint used to compare keypoints between images        
+        kp1, des1 = self.detector.detectAndCompute(img1, None) # None is no mask
+        kp2, des2 = self.detector.detectAndCompute(img2, None)
+
+        if des1 is None or des2 is None:
+            return np.array([]), np.array([])
+
+        # Match the descriptors between the two images using k-nearest neighbors (k-NN)
+        # For each descriptor in des1, it finds the k = 2 closest descriptors in des2 based on Euclidean distance
+        matches = self.matcher.knnMatch(des1, des2, k = 2) # a list of matches, where each match contains two neighbors  (k = 2)
+        #matches = self.matcher.match(des1, des2)
+        #matches = sorted(matches, key=lambda x: x.distance)
+
+        good_matches = []
+        for m, n in matches: # m is the best (closest match) and n is the second-best match
+            # we use the second-best to help determine if the best match is distinct or ambiguous
+            if m.distance < 0.6 * n.distance: # Lowe's Ratio test to reduce false positives in matching by ensuring the best match is distinct from the second-best match
+                good_matches.append(m) # if it satisfies the test, then add to good_matches
+
+        # For each "good match", retrieves the 2D coordinates of the corresponding keypoints
+        pts1 = np.float32([kp1[m.queryIdx].pt for m in good_matches]) # retrieving 2D position fo the keypoint in img1 corresponding to match m
+        pts2 = np.float32([kp2[m.trainIdx].pt for m in good_matches])
+        return pts1, pts2
+
+    
     def get_pose(self, i): # i is the index of the current frame
         """
         Calculates the transformation matrix for the i'th frame
@@ -575,22 +500,16 @@ class VisualOdometry():
         # We use the left images bc they are typically used for initial processing (eg. feature matching) before incorporating right images for depth calculations
         img1, img2 = self.images_l[i - 1], self.images_l[i]
 
-        # Getting the tiled keypoints
-        kp1_l = self.get_tiled_keypoints(img1, 10, 20)
+        # Match features between the two frames
+        tp1, tp2 = self.match_features(img1, img2) # tp1 and tp2 are the matched points in img1 and corresponding matched points in img2 respectively
         
-        # Track the keypoints
-        tp1_l, tp2_l = self.track_keypoints(img1, img2, kp1_l)
-        
-        if tp1_l is None or tp2_l is None:
-            return np.eye(4)
-    
         # Calculate the disparities
         # The disparity is calculated between the left image (ith frame) and the right image (ith frame) then divided by 16 to get actual values
         self.disparities.append(np.divide(self.disparity.compute(img2, self.images_r[i]).astype(np.float32), 16))
 
         # Calculate the right keypoints
         # Commutes the corresponding feature points in the right images based on the disparity values
-        tp1_l, tp1_r, tp2_l, tp2_r = self.calculate_right_qs(tp1_l, tp2_l, self.disparities[i - 1], self.disparities[i])
+        tp1_l, tp1_r, tp2_l, tp2_r = self.calculate_right_qs(tp1, tp2, self.disparities[i - 1], self.disparities[i])
                    
         # Calculate the 3D points
         Q1, Q2 = self.calc_3d(tp1_l, tp1_r, tp2_l, tp2_r)
@@ -641,7 +560,7 @@ def visualize_paths_with_error_and_rotation(gt_path, estimated_path, rotation_er
 def main():
     # This function integrates the visual odometry pipeline by calling get_pose and computes the estimated cam trajectory while comparing it to the ground truth
     
-    data_dir = 'C:/Users/james/OneDrive/Documents/University/Year 4/dataset/sequences/01'
+    data_dir = 'C:/Users/james/OneDrive/Documents/University/Year 4/dataset/sequences/03'
     vo = VisualOdometry(data_dir) # creates an instance of this class so will call __init__ when this happens
 
     gt_path = [] # stores the ground truth cam positions (from vo.gt_poses)
@@ -690,7 +609,7 @@ if __name__ == "__main__":
 #     - BFMatcher (self.matcher): matches features descriptors using the Hamming distance (can change methods if needed)
 #
 # PIPELINE FOR EACH FRAME (1-5 done in get_pose function)
-#   1) Feature Matching
+#   1) Feature Detecting and Matching
 #     - match_features(img1, img2): detects feature points and descriptors in two consecutive frames and matches descriptors between frames using k-NN and Lowe's test to find good points
 #   
 #   2) Disparity Map Calculation
