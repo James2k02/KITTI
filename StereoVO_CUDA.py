@@ -36,13 +36,13 @@ class VisualOdometry():
         self.disparities = [np.divide(self.disparity.compute(self.images_l[0], self.images_r[0]).astype(np.float32), 16)]
         
         # initializes ORB        
-        self.detector = cv2.cuda_ORB.create(2500) # ORB is a feature detector and descriptor extractor that is faster than SIFT and SURF
+        self.detector = cv2.cuda_ORB.create(2750) # ORB is a feature detector and descriptor extractor that is faster than SIFT and SURF
        
         # create a FLANN-based matcher for comparing feature descriptors
         FLANN_INDEX_LSH = 6
         index_params = dict(algorithm = FLANN_INDEX_LSH, table_number = 6, key_size = 12, multi_probe_level = 1)
         search_params = dict(checks = 100)  # Increase 'checks' for better accuracy
-        # self.matcher = cv2.FlannBasedMatcher(index_params, search_params)
+        #self.matcher = cv2.FlannBasedMatcher(index_params, search_params)
         self.matcher = cv2.cuda_DescriptorMatcher.createBFMatcher(cv2.NORM_HAMMING)
 
         
@@ -210,7 +210,7 @@ class VisualOdometry():
         
         # Create the transformation matrix from the rotation matrix and translation vector
         transf = self._form_transf(R, t) # uses previous function to combine rotation matrix R and translation vector t into a single 4x4 transformation matrix transf
-      
+        
         # Create the projection matrix for the i-1'th image and i'th image
         # Projecting 3D points from first image to the second image
         # mathematically: f_projection = P_l dot T --> T transforms points from the first frame to second frame
@@ -282,28 +282,34 @@ class VisualOdometry():
             # also applies a mask to filter points whose disparity values are within the range [min_disp, max_disp]
             q_idx = q.astype(int) # converts feature points to integer indices (disp maps are 2D arrays so we need integer coordinates to index into them)
             disp = disp.T[q_idx[:, 0], q_idx[:, 1]] # retrieves the disparity value for each feature point (q) from the disparity map (disp)
-            return disp, np.where(np.logical_and(min_disp < disp, disp < max_disp), True, False) # keeps points where disp is between min and max disp
+            return disp, cp.where(cp.logical_and(min_disp < disp, disp < max_disp), True, False) # keeps points where disp is between min and max disp
         
+        # Convert inputs to CuPy arrays
+        q1 = cp.asarray(q1)
+        q2 = cp.asarray(q2)
+        disp1 = cp.asarray(disp1)
+        disp2 = cp.asarray(disp2)
+    
         # Get the disparities for the feature points and mask for min_disp & max_disp
         disp1, mask1 = get_idxs(q1, disp1)
         disp2, mask2 = get_idxs(q2, disp2)
         
         # Combine the masks 
         # Ensures that only points that are valid in both frames are kept
-        in_bounds = np.logical_and(mask1, mask2)
+        in_bounds = cp.logical_and(mask1, mask2)
         
         # Filter the points using the mask which ensures that only feature points with valid disparity values in both frames are kept
         q1_l, q2_l, disp1, disp2 = q1[in_bounds], q2[in_bounds], disp1[in_bounds], disp2[in_bounds]
         
         # Calculate the right feature points 
         # Creating copies to do calculations
-        q1_r, q2_r = np.copy(q1_l), np.copy(q2_l)
+        q1_r, q2_r = cp.copy(q1_l), cp.copy(q2_l)
         
         # For stereo images, the right image point is horizontally shifted by the disparity value (so only the x value not y)
         q1_r[:, 0] -= disp1
         q2_r[:, 0] -= disp2
 
-        return q1_l, q1_r, q2_l, q2_r # valid feature points in the left images and the corresponding feature points in the right images
+        return cp.asnumpy(q1_l), cp.asnumpy(q1_r), cp.asnumpy(q2_l), cp.asnumpy(q2_r) # valid feature points in the left images and the corresponding feature points in the right images
     
     def calc_3d(self, q1_l, q1_r, q2_l, q2_r):
         """
@@ -345,14 +351,14 @@ class VisualOdometry():
         
         # Un-homogenize
         # Homogeneous coordinates represent points as [x,y,z,w] so we divide by w to get Cartesian coordinates [x,y,z] = [x/w, y/w, z/w]
-        Q1 = cp.transpose(Q1[:3] / Q1[3]) 
+        Q1 = np.transpose(Q1[:3] / Q1[3]) 
 
         # Triangulate points from i'th image
         Q2 = cv2.triangulatePoints(self.P_l, self.P_r, q2_l, q2_r)
         
         # Un-homogenize
-        Q2 = cp.transpose(Q2[:3] / Q2[3])
-        return cp.asnumpy(Q1), cp.asnumpy(Q2) # returns 3D coordinates of both frames (converting from cupy to numpy arrays)
+        Q2 = np.transpose(Q2[:3] / Q2[3])
+        return Q1, Q2 # returns 3D coordinates of both frames (converting from cupy to numpy arrays)
     
     def estimate_pose(self, q1, q2, Q1, Q2, max_iter = 100): # max iterations for optimization process
         """
@@ -486,12 +492,30 @@ class VisualOdometry():
         # We use the left images bc they are typically used for initial processing (eg. feature matching) before incorporating right images for depth calculations
         img1, img2 = self.images_l[i - 1], self.images_l[i]
 
-        # Match features between the two frames
-        tp1, tp2 = self.match_features(img1, img2) # tp1 and tp2 are the matched points in img1 and corresponding matched points in img2 respectively
+        # # Match features between the two frames
+        # tp1, tp2 = self.match_features(img1, img2) # tp1 and tp2 are the matched points in img1 and corresponding matched points in img2 respectively
+       
+        # # Calculate the disparities
+        # # The disparity is calculated between the left image (ith frame) and the right image (ith frame) then divided by 16 to get actual values
+        # self.disparities.append(np.divide(self.disparity.compute(img2, self.images_r[i]).astype(np.float32), 16))
         
+        # --TEST--
+        # Use ThreadPoolExecutor to parallelize feature matching and disparity computation
+        # it's like a task manager that allows you to run multiple functions at the same time using threads
+        with ThreadPoolExecutor(max_workers = 2) as executor:
+            # Submit feature matching task
+            future_match = executor.submit(self.match_features, img1, img2)
+        
+            # Submit disparity computation task
+            future_disp = executor.submit(self.disparity.compute, img2, self.images_r[i])
+        
+            # Get the results
+            tp1, tp2 = future_match.result()
+            disparity = future_disp.result()
+
         # Calculate the disparities
-        # The disparity is calculated between the left image (ith frame) and the right image (ith frame) then divided by 16 to get actual values
-        self.disparities.append(np.divide(self.disparity.compute(img2, self.images_r[i]).astype(np.float32), 16))
+        self.disparities.append(np.divide(disparity.astype(np.float32), 16))
+
 
         # Calculate the right keypoints
         # Commutes the corresponding feature points in the right images based on the disparity values
@@ -548,7 +572,7 @@ def visualize_paths_with_error_and_rotation(gt_path, estimated_path, rotation_er
 def main():
     # This function integrates the visual odometry pipeline by calling get_pose and computes the estimated cam trajectory while comparing it to the ground truth
     
-    data_dir = 'C:/Users/james/OneDrive/Documents/University/Year 4/dataset/sequences/03'
+    data_dir = 'C:/Users/james/OneDrive/Documents/University/Year 4/dataset/sequences/10'
     vo = VisualOdometry(data_dir) # creates an instance of this class so will call __init__ when this happens
 
     gt_path = [] # stores the ground truth cam positions (from vo.gt_poses)
@@ -575,6 +599,7 @@ def main():
     visualize_paths_with_error_and_rotation(gt_path, estimated_path, rotation_errors)
 
 if __name__ == "__main__":
-    main()          
+    main()
+     
     
     
