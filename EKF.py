@@ -1,10 +1,10 @@
 import numpy as np
-import cv2
 from filterpy.kalman import ExtendedKalmanFilter as EKF
 from scipy.spatial.transform import Rotation as R
 
 class EKF_VIO:
     def __init__(self, dt = 0.01):        
+        """ Initializing state vector, noise covariance matrices, and measurement matrix """
         # dt: time interval between two frames
         self.dt = dt
         
@@ -30,6 +30,7 @@ class EKF_VIO:
         self.ekf.H[3:, 6:10] = np.eye(4)[:3] # orientation measurement
         
     def state_transition(self, x, u):
+        """ Defining the state transition models for the EKF """
         dt = self.dt
         ax, ay, az, gx, gy, gz = u # acceleration and gyroscope measurements
         
@@ -44,9 +45,9 @@ class EKF_VIO:
         # Quaternion State Transition
         q = x[6:10]
         omega = np.array([0, gx, gy, gz])
-        q_dot = 0.5 * self.quaternion_product(q, omega)
+        q_dot = 0.5 * self.quaternion_product(q, omega) # no need to multiple by q because its already included in the function
         quat = q + q_dot * dt
-        quat /= np.linalg.norm(quat)
+        quat = R.from_quat(quat).as_quat() # normalizes the quaternion
         
         # Biases are kept constant
         biases = x[10:]
@@ -64,7 +65,8 @@ class EKF_VIO:
             q0*w3 + q1*w2 - q2*w1
         ])
         
-    def measurement_func(self, x): # this transforms the state vector x into the measurement space z
+    def measurement_func(self, x):
+        """ This transforms the state vector x into the measurement space z """
         return np.concatenate([x[:3], self.quaternion_to_euler(x[6:10])]) # first 3 elements are position and the rest are quaternions converted to euler angles
     # this function defines what the EKF "sees"; it maps the full state to only the observable parts (position and attitude)
     # links the EKF prediction to the measurement --> used in the update step to correct the state
@@ -77,22 +79,24 @@ class EKF_VIO:
         
     def update(self, z): # z is the measurement vector
          """ Updates the state using the VO measurements"""
-         self.ekf.update(z, HJacobian = self.jacobian_H, Hx = self.measurement_func)
+         self.ekf.update(z, HJacobian = self.compute_jacobian_F, Hx = self.measurement_func)
          
     def compute_jacobian_F(self, x, u): 
         """ Computes the full process Jacobian matrix F """
         dt = self.dt
-        F = np.eye(16)
-        F[:3, 3:6] = np.eye(3) * dt # adds a relationship between position and velocity
+        F = np.eye(16) # start with identity matrix which ensures that if there is no motion, the state remains unchanged
+        F[:3, 3:6] = np.eye(3) * dt # adds a relationship between position and velocity (represents the I3 in the F matrix)
         
         # Compute the dv/dq term
         a_B = np.array([u[0], u[1], u[2]]) # acceleration in body frame
-        Q_F = np.array([
-            [x[6], x[9], -x[8], x[7]],
-            [x[7], x[8], x[9], -x[6]],
-            [x[8], -x[7], x[6], x[9]]
+        Q_F = np.block([
+            [x[6:9].reshape(3, 1), x[9] * np.eye(3) + self.skew_symmetric(x[6:9])] # equation in doc is [qv q0*I3 + [qv x]] (qv x is the skew symmetric matrix)
         ])
-        dv_dq = 2* Q_F @ np.vstack((np.zeros((1, 3)), a_B.reshape(3, 1).T))
+        a_B_mat = np.block([
+            [np.zeros((1, 3)), a_B.reshape(1,3)],
+            [a_B.reshape(3, 1), -self.skew_symmetric(a_B)]
+        ])
+        dv_dq = 2 * Q_F @ a_B_mat
         F[3:6, 6:10] = dv_dq * dt # adds a relationship between velocity and quaternion
         
         # Quaternion update Jacobian
@@ -104,7 +108,26 @@ class EKF_VIO:
         ])
         F[6:10, 6:10] += 0.5 * omega * dt  # quaternion evolution
         
+        # Bias Effect
+        R_NB = R.from_quat(x[6:10]).as_matrix() # rotation matrix from body to NED frame
+        F[3:6, 13:16] = -R_NB * dt
+        
+        # Quaternion Noise Influence
+        noise = np.block([
+            [-x[6:9].reshape(1, 3)], # first row: -qv^T
+            [x[9] * np.eye(3) - self.skew_symmetric(x[6:9])] # second row: q0*I3 - [qv x]
+        ])
+        F[6:10, 10:13] = -0.5 * noise * dt
+        
         return F
+    
+    def skew_symmetric(self, x):
+        """ Computes the skew symmetric matrix of a quaternion """
+        return np.array([
+            [0, -x[2], x[1]],
+            [x[2], 0, -x[0]],
+            [-x[1], x[0], 0]
+        ])
         
         
         

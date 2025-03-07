@@ -545,7 +545,7 @@ def visualize_paths_with_error_and_rotation(gt_path, estimated_path, rotation_er
     plt.plot([p[0] for p in gt_path], [p[1] for p in gt_path], label="Ground Truth Path", color="green")
     plt.plot([p[0] for p in estimated_path], [p[1] for p in estimated_path], label="Estimated Path", color="blue")
     plt.xlabel("X-axis")
-    plt.ylabel("Z-axis")
+    plt.ylabel("Y-axis")
     plt.title(title)
     plt.legend()
     plt.grid()
@@ -572,7 +572,7 @@ def visualize_paths_with_error_and_rotation(gt_path, estimated_path, rotation_er
 def main():
     # This function integrates the visual odometry pipeline by calling get_pose and computes the estimated cam trajectory while comparing it to the ground truth
     
-    data_dir = 'C:/Users/james/OneDrive/Documents/University/Year 4/dataset/sequences/10'
+    data_dir = 'C:/Users/james/OneDrive/Documents/University/Year 4/dataset/sequences/01'
     vo = VisualOdometry(data_dir) # creates an instance of this class so will call __init__ when this happens
 
     gt_path = [] # stores the ground truth cam positions (from vo.gt_poses)
@@ -593,8 +593,8 @@ def main():
             rotation_errors.append(np.degrees(angle)) # convert to degrees then append to rotation_errors
 
         # Extracting the x and z coordinates of the cam position from the grouth truth pose and estimate pose and append them to specified variables
-        gt_path.append((gt_pose[0, 3], gt_pose[2, 3])) # it's [0, 3] and [2, 3] because the translation matrix is in the last row, 0 and 2 are x and z respectively
-        estimated_path.append((cur_pose[0, 3], cur_pose[2, 3]))
+        gt_path.append((gt_pose[0, 3], gt_pose[1, 3])) # it's [0, 3] and [2, 3] because the translation matrix is in the last row, 0 and 2 are x and z respectively
+        estimated_path.append((cur_pose[0, 3], cur_pose[1, 3]))
 
     visualize_paths_with_error_and_rotation(gt_path, estimated_path, rotation_errors)
 
