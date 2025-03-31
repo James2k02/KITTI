@@ -356,7 +356,7 @@ class VisualOdometry():
         Q2 = np.transpose(Q2[:3] / Q2[3])
         return Q1, Q2 # returns 3D coordinates of both frames
     
-    def estimate_pose(self, q1, q2, Q1, Q2, max_iter = 100, ransac_thresh = 3.0): # max iterations for optimization process
+    def estimate_pose(self, q1, q2, Q1, Q2, max_iter = 100): # max iterations for optimization process
         """
         Estimates the transformation matrix
 
@@ -449,7 +449,7 @@ class VisualOdometry():
     
     def match_features(self, img1, img2):
         # This function is part of a feature-matching pipeline that identifies corresponding points in two images based on feature descriptors
-        # The function matches keypoints (feature points0 between two images by:
+        # The function matches keypoints (feature points) between two images by:
         #   - detecting and describing keypoints in both images
         #   - matching the descriptors between the two images using a k-nearest neighbor (k-NN) approach
         #   - filtering the matches to keep only the "good matches"

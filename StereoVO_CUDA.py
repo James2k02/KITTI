@@ -28,7 +28,6 @@ class VisualOdometry():
         # create a stereo block matching object for computing disparity maps between left and right images
         # (min possible disp value; 0 = no shift, range of disparity values, size of block, smoothness parameters)
         # disparity value is just a number that represents the horizontal shift (in pixels) of a point between the left and right images
-        #self.disparity = cv2.StereoSGBM_create(minDisparity = 0, numDisparities = 64, blockSize = block, P1 = P1, P2 = P2, disp12MaxDiff = 1, uniquenessRatio = 12, speckleWindowSize = 75, speckleRange = 2, preFilterCap = 63) 
         self.disparity = cv2.cuda_StereoBM.create(numDisparities = 64, blockSize = 15)
         
         # compute and stores disparity map for first pair of images then divides the map by 16 to normalize them bc OpenCV disp values are scaled by 16
@@ -38,11 +37,7 @@ class VisualOdometry():
         # initializes ORB        
         self.detector = cv2.cuda_ORB.create(2750) # ORB is a feature detector and descriptor extractor that is faster than SIFT and SURF
        
-        # create a FLANN-based matcher for comparing feature descriptors
-        FLANN_INDEX_LSH = 6
-        index_params = dict(algorithm = FLANN_INDEX_LSH, table_number = 6, key_size = 12, multi_probe_level = 1)
-        search_params = dict(checks = 100)  # Increase 'checks' for better accuracy
-        #self.matcher = cv2.FlannBasedMatcher(index_params, search_params)
+        # create a brute force matcher for comparing feature descriptors
         self.matcher = cv2.cuda_DescriptorMatcher.createBFMatcher(cv2.NORM_HAMMING)
 
         
@@ -393,12 +388,10 @@ class VisualOdometry():
             in_guess = np.zeros(6) # 6 parameters: rx, ry, rz, tx, ty, tz for rotation and translation
             
             # Perform least squares optimization
-            # Optimizes the transformation parameters to minimize
+            # Optimizes the transformation parameters to minimize errors
             # Technically don't need the optimization and can just use identity matrix as initial guess but this helps with noise
             # self.reprojection_residuals: computes the reprojection error for given transformation parameters
             # in_guess: initial guess for optimization
-            # method = 'lm': Levenberg-Marquardt optimization method (good for non-linear problems)
-            # max_nfev = 200: max number of function evaluations
             # args: passes the sampled 2D and 3D points as arguments
             opt_res = least_squares(self.reprojection_residuals, in_guess, method = 'trf', loss= 'huber', f_scale = 2.0, max_nfev = 200,
                                     args = (sample_q1, sample_q2, sample_Q1, sample_Q2))
@@ -572,7 +565,7 @@ def visualize_paths_with_error_and_rotation(gt_path, estimated_path, rotation_er
 def main():
     # This function integrates the visual odometry pipeline by calling get_pose and computes the estimated cam trajectory while comparing it to the ground truth
     
-    data_dir = 'C:/Users/james/OneDrive/Documents/University/Year 4/dataset/sequences/01'
+    data_dir = 'C:/Users/james/OneDrive/Documents/University/Year 4/dataset/sequences/10'
     vo = VisualOdometry(data_dir) # creates an instance of this class so will call __init__ when this happens
 
     gt_path = [] # stores the ground truth cam positions (from vo.gt_poses)
@@ -593,8 +586,8 @@ def main():
             rotation_errors.append(np.degrees(angle)) # convert to degrees then append to rotation_errors
 
         # Extracting the x and z coordinates of the cam position from the grouth truth pose and estimate pose and append them to specified variables
-        gt_path.append((gt_pose[0, 3], gt_pose[1, 3])) # it's [0, 3] and [2, 3] because the translation matrix is in the last row, 0 and 2 are x and z respectively
-        estimated_path.append((cur_pose[0, 3], cur_pose[1, 3]))
+        gt_path.append((gt_pose[0, 3], gt_pose[2, 3])) # it's [0, 3] and [2, 3] because the translation matrix is in the last row, 0 and 2 are x and z respectively
+        estimated_path.append((cur_pose[0, 3], cur_pose[2, 3]))
 
     visualize_paths_with_error_and_rotation(gt_path, estimated_path, rotation_errors)
 
